@@ -422,6 +422,12 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 	if err := client.RestoreWithNetFDs(ctx, restoreDir, restoredNets, memMode); err != nil {
 		return fmt.Errorf("while restoring VM with net FDs: %w", err)
 	}
+	if hasDurableVolumes(p.containers) {
+		if err := enablePmemHugepages(chProc.PID(), durableMountsDir(p.actorDirs)); err != nil {
+			slog.WarnContext(ctx, "failed to enable hugepages on restored durable pmem mapping",
+				slog.String("actorUID", actorUID), slog.Any("err", err))
+		}
+	}
 	tVMRestore := time.Now()
 	// An eager restore has read the whole snapshot into guest memory, and nothing
 	// merges against it afterwards, so drop the staged memory image and evict its

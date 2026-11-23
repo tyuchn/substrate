@@ -53,6 +53,7 @@ const (
 
 	writeDiskRoute = "/writedisk"
 	readDiskRoute  = "/readdisk"
+	runScriptRoute = "/runscript"
 
 	durDirTestFile = "bench-data"
 
@@ -122,6 +123,7 @@ func (r *durDirRuntime) startUser(ctx context.Context, dynCfg durDirKnobs) (*dur
 		actorName:    "sb-" + uuid.NewString(),
 		templateName: tmpl,
 		userClass:    durDirUserClass,
+		firstSuspend: true,
 	}
 	bmetrics.UpdateUsers(durDirUserClass, 1)
 	if err := u.ensureAtespace(ctx); err != nil {
@@ -155,8 +157,10 @@ type durDirUser struct {
 	actorName      string
 	templateName   string
 	userClass      string
+	firstSuspend   bool
 	expectedDigest string
 	expectedSize   int64
+	fileCursor     int
 }
 
 func (u *durDirUser) ref() *ateapipb.ObjectRef {
@@ -194,12 +198,12 @@ func (u *durDirUser) create(ctx context.Context) error {
 	})
 }
 
-func (u *durDirUser) resume(ctx context.Context, mode string) bool {
+func (u *durDirUser) resume(ctx context.Context, mode, metricName string) bool {
 	// In implicit mode, the actor stays suspended until router traffic wakes it.
 	if mode == dynconfig.ResumeModeImplicit {
 		return true
 	}
-	err := u.tracedCall(ctx, "ResumeActor", func(callCtx context.Context, tr *metadata.MD) error {
+	err := u.tracedCall(ctx, metricName, func(callCtx context.Context, tr *metadata.MD) error {
 		_, err := u.cfg.APIStub.ResumeActor(callCtx, &ateapipb.ResumeActorRequest{
 			Actor: u.ref(),
 		}, grpc.Trailer(tr))
@@ -209,23 +213,37 @@ func (u *durDirUser) resume(ctx context.Context, mode string) bool {
 }
 
 func (u *durDirUser) pause(ctx context.Context) {
-	_ = u.tracedCall(ctx, "SuspendActorAsync", func(callCtx context.Context, tr *metadata.MD) error {
+	metricName := "SuspendActorAsync"
+	if u.firstSuspend {
+		metricName = "SuspendActorAsyncFirstSuspend"
+	}
+	err := u.tracedCall(ctx, metricName, func(callCtx context.Context, tr *metadata.MD) error {
 		_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
 			Actor:   u.ref(),
 			Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS},
 		}, grpc.Trailer(tr))
 		return err
 	})
+	if err == nil {
+		u.firstSuspend = false
+	}
 }
 
 func (u *durDirUser) suspend(ctx context.Context) {
-	_ = u.tracedCall(ctx, "SuspendActor", func(callCtx context.Context, tr *metadata.MD) error {
+	metricName := "SuspendActor"
+	if u.firstSuspend {
+		metricName = "SuspendActorFirstSuspend"
+	}
+	err := u.tracedCall(ctx, metricName, func(callCtx context.Context, tr *metadata.MD) error {
 		_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
 			Actor:   u.ref(),
 			Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
 		}, grpc.Trailer(tr))
 		return err
 	})
+	if err == nil {
+		u.firstSuspend = false
+	}
 }
 
 func (u *durDirUser) hibernate(ctx context.Context, dynCfg durDirKnobs) {
@@ -304,11 +322,28 @@ func (u *durDirUser) step(ctx context.Context, dynCfg durDirKnobs) {
 	u.hibernate(ctx, dynCfg)
 
 	// 2. Resume — a no-op in implicit mode, where router traffic wakes the actor.
-	if !u.resume(ctx, dynCfg.ResumeMode) {
+	if !u.resume(ctx, dynCfg.ResumeMode, "ResumeActor") {
 		return
 	}
 
 	// 3. Serve after resume (durability assertion: verify restored bytes)
+	if dynCfg.NumFiles > 1 {
+		if err := u.readMultiDisk(ctx, "DurDirServeAfterResume", dynCfg.NumFiles, fileSize, readMode); err != nil {
+			return
+		}
+		if err := u.readMultiDisk(ctx, "DurDirServeWarm", dynCfg.NumFiles, fileSize, readMode); err != nil {
+			return
+		}
+		churnFiles := dynCfg.NumFiles
+		if dynCfg.ChurnSize > 0 {
+			churnFiles = max(1, min(dynCfg.NumFiles, int((dynCfg.ChurnSize+fileSize-1)/fileSize)))
+		}
+		if err := u.writeMultiDisk(ctx, "DurDirOverwrite", dynCfg.NumFiles, u.fileCursor, churnFiles, fileSize); err != nil {
+			return
+		}
+		u.fileCursor = (u.fileCursor + churnFiles) % dynCfg.NumFiles
+		return
+	}
 	if err := u.readDisk(ctx, "DurDirServeAfterResume", readMode); err != nil {
 		return
 	}
@@ -319,7 +354,13 @@ func (u *durDirUser) step(ctx context.Context, dynCfg durDirKnobs) {
 	}
 
 	// 5. Overwrite file with fresh random bytes
-	if err := u.writeDisk(ctx, "DurDirOverwrite", fileSize, gluttonpb.WriteMode_WRITE_MODE_TRUNCATE); err != nil {
+	writeSize := fileSize
+	writeMode := gluttonpb.WriteMode_WRITE_MODE_TRUNCATE
+	if dynCfg.ChurnSize > 0 {
+		writeSize = dynCfg.ChurnSize
+		writeMode = gluttonpb.WriteMode_WRITE_MODE_OVERWRITE_ROTATE
+	}
+	if err := u.writeDisk(ctx, "DurDirOverwrite", writeSize, writeMode); err != nil {
 		return
 	}
 }
@@ -327,8 +368,18 @@ func (u *durDirUser) step(ctx context.Context, dynCfg durDirKnobs) {
 func (u *durDirUser) bootstrap(ctx context.Context, dynCfg durDirKnobs) error {
 	fileSize, readMode := u.params(dynCfg)
 
-	if !u.resume(ctx, dynCfg.ResumeMode) {
+	if !u.resume(ctx, dynCfg.ResumeMode, "ResumeActorFirstResume") {
 		return fmt.Errorf("initial resume failed")
+	}
+
+	if dynCfg.NumFiles > 1 {
+		if err := u.writeMultiDisk(ctx, "DurDirWrite", dynCfg.NumFiles, 0, dynCfg.NumFiles, fileSize); err != nil {
+			return fmt.Errorf("initial multi WriteDisk failed: %w", err)
+		}
+		if err := u.readMultiDisk(ctx, "DurDirServeInitial", dynCfg.NumFiles, fileSize, readMode); err != nil {
+			return fmt.Errorf("initial multi ReadDisk failed: %w", err)
+		}
+		return nil
 	}
 
 	// Initial write to create DurDir file
@@ -344,6 +395,96 @@ func (u *durDirUser) bootstrap(ctx context.Context, dynCfg durDirKnobs) error {
 	return nil
 }
 
+func (u *durDirUser) writeMultiDisk(ctx context.Context, metricName string, numFiles, startIdx, count int, fileSize int64) error {
+	steps := make([]*gluttonpb.Step, count)
+	for i := 0; i < count; i++ {
+		idx := (startIdx + i) % numFiles
+		steps[i] = &gluttonpb.Step{
+			Kind: &gluttonpb.Step_Operation{
+				Operation: &gluttonpb.Operation{
+					Requests: []*gluttonpb.Request{{
+						Kind: &gluttonpb.Request_WriteDisk{
+							WriteDisk: &gluttonpb.WriteDiskRequest{
+								Key:       fmt.Sprintf("%s-%04d", durDirTestFile, idx),
+								Size:      int32(fileSize),
+								WriteMode: gluttonpb.WriteMode_WRITE_MODE_TRUNCATE,
+							},
+						},
+					}},
+				},
+			},
+		}
+	}
+	req := &gluttonpb.RunScriptRequest{
+		Script: &gluttonpb.Block{Steps: steps},
+	}
+	body, err := proto.Marshal(req)
+	if err != nil {
+		bmetrics.RecordFailure("http", metricName, u.userClass, 0, err.Error())
+		return err
+	}
+	wantBytes := int64(count) * fileSize
+	_, err = u.httpProtoCall(ctx, metricName, runScriptRoute, body, func(respBytes []byte) error {
+		var resp gluttonpb.RunScriptResponse
+		if err := proto.Unmarshal(respBytes, &resp); err != nil {
+			return fmt.Errorf("unmarshal RunScriptResponse: %w", err)
+		}
+		stats := resp.GetResult().GetStats()
+		if stats.GetRequestsRun() != int64(count) {
+			return fmt.Errorf("RunScript write requests_run=%d, want %d", stats.GetRequestsRun(), count)
+		}
+		if stats.GetDiskBytesWritten() != wantBytes {
+			return fmt.Errorf("RunScript disk_bytes_written=%d, want %d", stats.GetDiskBytesWritten(), wantBytes)
+		}
+		return nil
+	})
+	return err
+}
+
+func (u *durDirUser) readMultiDisk(ctx context.Context, metricName string, numFiles int, fileSize int64, readMode gluttonpb.ReadMode) error {
+	steps := make([]*gluttonpb.Step, numFiles)
+	for i := 0; i < numFiles; i++ {
+		steps[i] = &gluttonpb.Step{
+			Kind: &gluttonpb.Step_Operation{
+				Operation: &gluttonpb.Operation{
+					Requests: []*gluttonpb.Request{{
+						Kind: &gluttonpb.Request_ReadDisk{
+							ReadDisk: &gluttonpb.ReadDiskRequest{
+								Key:      fmt.Sprintf("%s-%04d", durDirTestFile, i),
+								ReadMode: readMode,
+							},
+						},
+					}},
+				},
+			},
+		}
+	}
+	req := &gluttonpb.RunScriptRequest{
+		Script: &gluttonpb.Block{Steps: steps},
+	}
+	body, err := proto.Marshal(req)
+	if err != nil {
+		bmetrics.RecordFailure("http", metricName, u.userClass, 0, err.Error())
+		return err
+	}
+	wantBytes := int64(numFiles) * fileSize
+	_, err = u.httpProtoCall(ctx, metricName, runScriptRoute, body, func(respBytes []byte) error {
+		var resp gluttonpb.RunScriptResponse
+		if err := proto.Unmarshal(respBytes, &resp); err != nil {
+			return fmt.Errorf("unmarshal RunScriptResponse: %w", err)
+		}
+		stats := resp.GetResult().GetStats()
+		if stats.GetRequestsRun() != int64(numFiles) {
+			return fmt.Errorf("RunScript read requests_run=%d, want %d", stats.GetRequestsRun(), numFiles)
+		}
+		if stats.GetDiskBytesRead() != wantBytes {
+			return fmt.Errorf("RunScript disk_bytes_read=%d, want %d", stats.GetDiskBytesRead(), wantBytes)
+		}
+		return nil
+	})
+	return err
+}
+
 func (u *durDirUser) writeDisk(ctx context.Context, metricName string, size int64, mode gluttonpb.WriteMode) error {
 	req := &gluttonpb.WriteDiskRequest{
 		Key:       durDirTestFile,
@@ -356,6 +497,11 @@ func (u *durDirUser) writeDisk(ctx context.Context, metricName string, size int6
 		return err
 	}
 
+	wantSize := size
+	if mode != gluttonpb.WriteMode_WRITE_MODE_TRUNCATE && u.expectedSize > size {
+		wantSize = u.expectedSize
+	}
+
 	var newDigest string
 	var newSize int64
 	_, err = u.httpProtoCall(ctx, metricName, writeDiskRoute, body, func(respBytes []byte) error {
@@ -363,8 +509,8 @@ func (u *durDirUser) writeDisk(ctx context.Context, metricName string, size int6
 		if err := proto.Unmarshal(respBytes, &resp); err != nil {
 			return fmt.Errorf("unmarshal WriteDiskResponse: %w", err)
 		}
-		if resp.GetSize() != size {
-			return fmt.Errorf("WriteDisk size mismatch: got %d, want %d", resp.GetSize(), size)
+		if resp.GetSize() != wantSize {
+			return fmt.Errorf("WriteDisk size mismatch: got %d, want %d", resp.GetSize(), wantSize)
 		}
 		if len(resp.GetSha256()) == 0 {
 			return fmt.Errorf("WriteDisk sha256 is empty")

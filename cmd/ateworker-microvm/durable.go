@@ -182,15 +182,15 @@ func untarDurableVolumes(dir, snapshotDir string, volumes []string, preserveRest
 			return fmt.Errorf("while inspecting durable-dir archive %q: %w", tarPath, err)
 		}
 		volDir := filepath.Join(dir, vol)
+		imgPath := filepath.Join(dir, vol+".ext4")
+		if preserveRestoreDir {
+			if st, serr := os.Stat(imgPath); serr == nil && st.Mode().IsRegular() {
+				continue
+			}
+		}
 		if isExt4Image(tarPath) {
 			if err := os.MkdirAll(volDir, 0o777); err != nil {
 				return fmt.Errorf("while creating durable-dir volume dir %q: %w", volDir, err)
-			}
-			imgPath := filepath.Join(dir, vol+".ext4")
-			if preserveRestoreDir {
-				if st, serr := os.Stat(imgPath); serr == nil && st.Mode().IsRegular() {
-					continue
-				}
 			}
 			if err := cloneFileCoW(tarPath, imgPath); err != nil {
 				return fmt.Errorf("while restoring durable-dir volume image %q: %w", vol, err)

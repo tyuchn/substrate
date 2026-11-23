@@ -562,6 +562,12 @@ func (s *AteWorkerService) coldBootActor(ctx context.Context, p actorBootParams)
 	if err := client.CreateVM(ctx, vmCfg); err != nil {
 		return fmt.Errorf("while creating VM: %w", err)
 	}
+	if len(durableVols) > 0 {
+		if err := enablePmemHugepages(chProc.PID(), durableMountsDir(p.actorDirs)); err != nil {
+			slog.WarnContext(ctx, "failed to enable hugepages on durable pmem mapping",
+				slog.String("actorUID", actorUID), slog.Any("err", err))
+		}
+	}
 
 	// Network device: build the actor's tap and add a virtio-net to the created
 	// (pre-boot) VM with its FDs (SCM_RIGHTS).

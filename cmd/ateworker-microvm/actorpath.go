@@ -290,14 +290,33 @@ func ensureGoldenDurableExt4Image(durableDir string) (string, error) {
 		_ = tmp.Close()
 		return "", fmt.Errorf("while sizing temp golden ext4 image: %w", err)
 	}
+	// Write metadata extents through a 2 MiB THP-advised shared mapping so
+	// the filesystem allocates 2 MiB-aligned order-9 folios and disk extents
+	// for the metadata chunks (chunk 0 and chunk 8) while leaving the rest of
+	// the 1 GiB image sparse.
+	mapped, mmapErr := unix.Mmap(int(tmp.Fd()), 0, int(totalSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	if mmapErr == nil {
+		_ = unix.Madvise(mapped, unix.MADV_HUGEPAGE)
+	}
 	for range numExtents {
 		var extHdr [16]byte
 		if _, err := io.ReadFull(zr, extHdr[:]); err != nil {
+			if mmapErr == nil {
+				_ = unix.Munmap(mapped)
+			}
 			_ = tmp.Close()
 			return "", fmt.Errorf("while reading golden ext4 extent header: %w", err)
 		}
 		off := int64(binary.LittleEndian.Uint64(extHdr[0:8]))
 		length := int64(binary.LittleEndian.Uint64(extHdr[8:16]))
+		if mmapErr == nil {
+			if _, err := io.ReadFull(zr, mapped[off:off+length]); err != nil {
+				_ = unix.Munmap(mapped)
+				_ = tmp.Close()
+				return "", fmt.Errorf("while writing temp golden ext4 extent via mmap: %w", err)
+			}
+			continue
+		}
 		if _, err := tmp.Seek(off, io.SeekStart); err != nil {
 			_ = tmp.Close()
 			return "", fmt.Errorf("while seeking temp golden ext4 image: %w", err)
@@ -305,6 +324,12 @@ func ensureGoldenDurableExt4Image(durableDir string) (string, error) {
 		if _, err := io.CopyN(tmp, zr, length); err != nil {
 			_ = tmp.Close()
 			return "", fmt.Errorf("while writing temp golden ext4 extent: %w", err)
+		}
+	}
+	if mmapErr == nil {
+		if err := unix.Munmap(mapped); err != nil {
+			_ = tmp.Close()
+			return "", fmt.Errorf("while unmapping temp golden ext4 image: %w", err)
 		}
 	}
 	if err := tmp.Chmod(0o600); err != nil {
@@ -330,6 +355,20 @@ func setExt4UUID(path string) error {
 		return fmt.Errorf("while opening ext4 image %s for UUID update: %w", path, err)
 	}
 	defer f.Close()
+
+	// Update the superblock through a 2 MiB MADV_HUGEPAGE mapping so chunk 0
+	// (0..2 MiB) is faulted into the page cache as an order-9 (2 MiB) folio
+	// rather than an order-0 (4 KiB) folio from pread/pwrite.
+	if st, err := f.Stat(); err == nil && st.Size() >= 2<<20 {
+		if b, merr := unix.Mmap(int(f.Fd()), 0, 2<<20, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED); merr == nil {
+			_ = unix.Madvise(b, unix.MADV_HUGEPAGE)
+			sb := b[1024:2048]
+			copy(sb[0x68:0x78], u[:])
+			csum := ^crc32.Checksum(sb[:0x3fc], castagnoliTable)
+			binary.LittleEndian.PutUint32(sb[0x3fc:0x400], csum)
+			return unix.Munmap(b)
+		}
+	}
 
 	var sb [1024]byte
 	if _, err := f.ReadAt(sb[:], 1024); err != nil {
