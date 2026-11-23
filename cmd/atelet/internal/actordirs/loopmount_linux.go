@@ -43,6 +43,7 @@ const (
 	lvmVolumeSize       = 16 << 30 // 16 GiB per VDUSE ZBD volume (64 x 256 MiB zones)
 	loopPoolDefaultSize = 36
 	blkResetZoneIoctl   = 0x40101283 // _IOW(0x12, 131, struct blk_zone_range)
+	ramCacheRoot        = "/var/lib/ate/ram-cache"
 )
 
 type blkZoneRange struct {
@@ -148,8 +149,35 @@ func prewarmLVMVolume(lvPath string, extents []sparseExtent) error {
 	return resetAndWriteTemplate(f, extents)
 }
 
+func ensureRamCacheTmpfs() {
+	if err := os.MkdirAll(ramCacheRoot, 0o755); err != nil {
+		slog.Error("Failed to create ram-cache directory", "path", ramCacheRoot, "err", err)
+		return
+	}
+	var st unix.Statfs_t
+	if err := unix.Statfs(ramCacheRoot, &st); err == nil && st.Type == unix.TMPFS_MAGIC {
+		// Remount with huge=advise in case a plain tmpfs was left mounted.
+		_ = unix.Mount("tmpfs", ramCacheRoot, "tmpfs", unix.MS_REMOUNT, "huge=advise,size=64G,mode=0755")
+	} else {
+		if err := unix.Mount("tmpfs", ramCacheRoot, "tmpfs", unix.MS_NOATIME|unix.MS_NODIRATIME, "huge=advise,size=64G,mode=0755"); err != nil {
+			slog.Error("Failed to mount tmpfs with huge=advise on ram-cache", "path", ramCacheRoot, "err", err)
+			return
+		}
+	}
+	if entries, err := os.ReadDir(ramCacheRoot); err == nil {
+		for _, entry := range entries {
+			uid := entry.Name()
+			if _, serr := os.Stat(ateletpath.ActorPath(uid)); errors.Is(serr, os.ErrNotExist) {
+				_ = os.RemoveAll(filepath.Join(ramCacheRoot, uid))
+			}
+		}
+	}
+	slog.Info("Mounted 2 MiB THP tmpfs working cache", "path", ramCacheRoot)
+}
+
 func initLoopPool() {
 	start := time.Now()
+	ensureRamCacheTmpfs()
 
 	// Unmount any snapshot mounts left over from a previous atelet run before
 	// reformatting all LVM slots into loopPoolFree.
@@ -306,6 +334,7 @@ func ensureSnapshotLoopMount(actorUID string) error {
 }
 
 func teardownSnapshotLoopMount(actorUID string) error {
+	_ = os.RemoveAll(filepath.Join(ramCacheRoot, actorUID))
 	if _, err := os.Stat(lvmVGDir); err != nil {
 		return nil
 	}

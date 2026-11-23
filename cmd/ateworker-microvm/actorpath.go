@@ -31,6 +31,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"go.ate.dev/substrate/internal/btrfssubvol"
@@ -71,14 +72,20 @@ func activeSubvolDir(actorDirs *ateworkerpb.ActorDirs) string {
 	return filepath.Join(snapshotRootDir(actorDirs), "active")
 }
 
-// guestMemoryFile returns "" so guest RAM is backed by anonymous memfd rather
-// than a MAP_SHARED file on Btrfs; memory-ranges is written sequentially on
-// snapshot and read sequentially on restore.
-func guestMemoryFile(_ *ateworkerpb.ActorDirs) string {
+// guestMemoryFile returns the tmpfs 2 MiB THP shared memory zone path when the
+// node's ram-cache tmpfs is mounted alongside a btrfs snapshot volume, or ""
+// when guest RAM is memfd-backed.
+func guestMemoryFile(actorDirs *ateworkerpb.ActorDirs) string {
+	if useTmpfsRamCache(actorDirs) {
+		return filepath.Join(actorRamCacheDir(actorDirs), memoryRangesFile)
+	}
 	return ""
 }
 
 func prepareGuestMemoryFile(path string, sizeBytes int64) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("while creating guest memory parent dir for %s: %w", path, err)
+	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("while creating guest memory file %s: %w", path, err)
@@ -206,8 +213,13 @@ func cloneFileCoW(srcPath, dstPath string) error {
 }
 
 // durableMountsDir returns the directory backing the actor's durable-dir
-// volumes. On btrfs snapshot filesystems it lives inside the active subvolume.
+// volumes. When the tmpfs 2 MiB THP cache is active over btrfs snapshots, live
+// virtio-pmem DAX images reside on tmpfs and sync incrementally to btrfs on
+// checkpoint.
 func durableMountsDir(actorDirs *ateworkerpb.ActorDirs) string {
+	if useTmpfsRamCache(actorDirs) {
+		return filepath.Join(actorRamCacheDir(actorDirs), "durable-dir")
+	}
 	if isBtrfsSnapshotDir(actorDirs) {
 		return filepath.Join(activeSubvolDir(actorDirs), "durable-dir")
 	}
@@ -220,7 +232,9 @@ func durableVolumeImagePath(actorDirs *ateworkerpb.ActorDirs, vol string) string
 
 func ensureGoldenDurableExt4Image(durableDir string) (string, error) {
 	goldenDir := durableDir
-	if filepath.Base(filepath.Dir(durableDir)) == "active" {
+	if strings.HasPrefix(durableDir, ramCacheBaseDir+"/") {
+		goldenDir = ramCacheBaseDir
+	} else if filepath.Base(filepath.Dir(durableDir)) == "active" {
 		goldenDir = filepath.Dir(filepath.Dir(filepath.Dir(durableDir)))
 	}
 	goldenPath := filepath.Join(goldenDir, ".golden-durable-ext4-1g-2m.img")
@@ -408,7 +422,11 @@ func ensureDurableMountDirs(durableDir string, containers []*ateworkerpb.Contain
 				return err
 			}
 		}
-		if err := cloneFileCoW(goldenPath, imgPath); err != nil {
+		if strings.HasPrefix(imgPath, ramCacheBaseDir+"/") {
+			if err := stageTmpfsHugepageFile(goldenPath, imgPath); err != nil {
+				return fmt.Errorf("while staging golden ext4 image to tmpfs %s: %w", imgPath, err)
+			}
+		} else if err := cloneFileCoW(goldenPath, imgPath); err != nil {
 			return fmt.Errorf("while cloning golden ext4 image to %s: %w", imgPath, err)
 		}
 		if err := setExt4UUID(imgPath); err != nil {
@@ -419,6 +437,15 @@ func ensureDurableMountDirs(durableDir string, containers []*ateworkerpb.Contain
 }
 
 func prepareActiveSubvolForRun(actorDirs *ateworkerpb.ActorDirs, containers []*ateworkerpb.Container) error {
+	if useTmpfsRamCache(actorDirs) {
+		ramDir := actorRamCacheDir(actorDirs)
+		if err := os.RemoveAll(ramDir); err != nil {
+			return fmt.Errorf("while clearing actor ram-cache %s: %w", ramDir, err)
+		}
+		if err := os.MkdirAll(filepath.Join(ramDir, "durable-dir"), 0o755); err != nil {
+			return fmt.Errorf("while creating actor ram-cache %s: %w", ramDir, err)
+		}
+	}
 	if isBtrfsSnapshotDir(actorDirs) {
 		if err := btrfssubvol.Create(activeSubvolDir(actorDirs)); err != nil {
 			return fmt.Errorf("while creating active btrfs subvolume: %w", err)
@@ -427,12 +454,20 @@ func prepareActiveSubvolForRun(actorDirs *ateworkerpb.ActorDirs, containers []*a
 	return ensureDurableMountDirs(durableMountsDir(actorDirs), containers)
 }
 
-func writeBtrfsCheckpointToken(dir string) error {
+func newCheckpointTokenBytes() ([]byte, error) {
 	nonce, err := newReseedNonce()
+	if err != nil {
+		return nil, err
+	}
+	return fmt.Appendf(nil, "%x\n", nonce), nil
+}
+
+func writeBtrfsCheckpointToken(dir string) error {
+	tok, err := newCheckpointTokenBytes()
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, btrfsCheckpointTokenFile), fmt.Appendf(nil, "%x\n", nonce), 0o600)
+	return os.WriteFile(filepath.Join(dir, btrfsCheckpointTokenFile), tok, 0o600)
 }
 
 func canReuseActiveSubvol(activeDir, restoreDir string) bool {
@@ -450,10 +485,11 @@ func canReuseActiveSubvol(activeDir, restoreDir string) bool {
 	return bytes.Equal(activeTok, restoreTok)
 }
 
-func prepareActiveSubvolForRestore(actorDirs *ateworkerpb.ActorDirs, restoreDir string, _ []*ateworkerpb.Container) error {
+func prepareActiveSubvolForRestore(actorDirs *ateworkerpb.ActorDirs, restoreDir string, containers []*ateworkerpb.Container) error {
 	if !isBtrfsSnapshotDir(actorDirs) {
 		return nil
 	}
+	useRam := useTmpfsRamCache(actorDirs)
 	activeDir := activeSubvolDir(actorDirs)
 	if btrfssubvol.IsSubvolume(restoreDir) {
 		if !canReuseActiveSubvol(activeDir, restoreDir) {
@@ -464,15 +500,85 @@ func prepareActiveSubvolForRestore(actorDirs *ateworkerpb.ActorDirs, restoreDir 
 		_ = os.Remove(filepath.Join(activeDir, btrfsCheckpointTokenFile))
 		_ = os.Remove(filepath.Join(activeDir, "manifest.json"))
 		_ = os.Remove(filepath.Join(activeDir, memoryRangesFile))
+		_ = os.Remove(filepath.Join(activeDir, memCrc32cFile))
+		if useRam {
+			_ = os.RemoveAll(filepath.Join(activeDir, "durable-dir"))
+		}
 	} else {
 		if err := btrfssubvol.Create(activeDir); err != nil {
 			return fmt.Errorf("while creating active btrfs subvolume: %w", err)
+		}
+	}
+
+	if !useRam {
+		return nil
+	}
+
+	ramDir := actorRamCacheDir(actorDirs)
+	restoreTok, _ := os.ReadFile(filepath.Join(restoreDir, btrfsCheckpointTokenFile))
+	cleanTok, _ := os.ReadFile(filepath.Join(ramDir, ramCleanTokenFile))
+	// Consume clean-token before resuming the guest so any subsequent rollback or
+	// retry after guest execution re-stages from the immutable snapshot.
+	_ = os.Remove(filepath.Join(ramDir, ramCleanTokenFile))
+
+	restoreTokTrim := bytes.TrimSpace(restoreTok)
+	if len(restoreTokTrim) > 0 && bytes.Equal(restoreTokTrim, bytes.TrimSpace(cleanTok)) {
+		needMem := false
+		if _, err := os.Stat(filepath.Join(restoreDir, memoryRangesFile)); err == nil {
+			needMem = true
+		}
+		_, ramMemErr := os.Stat(filepath.Join(ramDir, memoryRangesFile))
+		if !needMem || ramMemErr == nil {
+			_ = os.WriteFile(filepath.Join(ramDir, ramBaseTokenFile), restoreTok, 0o600)
+			return nil
+		}
+	}
+
+	// Cold restore, golden snapshot restore, or rollback: stage into 2 MiB THP tmpfs.
+	if err := os.RemoveAll(ramDir); err != nil {
+		return fmt.Errorf("while clearing actor ram-cache %s: %w", ramDir, err)
+	}
+	if err := os.MkdirAll(filepath.Join(ramDir, "durable-dir"), 0o755); err != nil {
+		return fmt.Errorf("while creating actor ram-cache %s: %w", ramDir, err)
+	}
+
+	srcMem := filepath.Join(restoreDir, memoryRangesFile)
+	if _, err := os.Stat(srcMem); err == nil {
+		if err := stageTmpfsHugepageFile(srcMem, filepath.Join(ramDir, memoryRangesFile)); err != nil {
+			return fmt.Errorf("while staging restore memory-ranges to tmpfs: %w", err)
+		}
+	}
+
+	if btrfssubvol.IsSubvolume(restoreDir) {
+		if len(restoreTokTrim) > 0 {
+			_ = os.WriteFile(filepath.Join(ramDir, ramBaseTokenFile), restoreTok, 0o600)
+		}
+		if crcBytes, cerr := os.ReadFile(filepath.Join(restoreDir, memCrc32cFile)); cerr == nil {
+			_ = os.WriteFile(filepath.Join(ramDir, memCrc32cFile), crcBytes, 0o600)
+		}
+		for _, vol := range durableVolumeNames(containers) {
+			srcExt4 := filepath.Join(restoreDir, "durable-dir", vol+".ext4")
+			if st, serr := os.Stat(srcExt4); serr == nil && st.Mode().IsRegular() {
+				if err := os.MkdirAll(filepath.Join(ramDir, "durable-dir", vol), 0o777); err != nil {
+					return err
+				}
+				if err := stageTmpfsHugepageFile(srcExt4, filepath.Join(ramDir, "durable-dir", vol+".ext4")); err != nil {
+					return fmt.Errorf("while staging restore durable volume %s to tmpfs: %w", vol, err)
+				}
+				crcName := durableCrcFileName(vol)
+				if crcBytes, cerr := os.ReadFile(filepath.Join(restoreDir, crcName)); cerr == nil {
+					_ = os.WriteFile(filepath.Join(ramDir, crcName), crcBytes, 0o600)
+				}
+			}
 		}
 	}
 	return nil
 }
 
 func cleanupActiveOrRootfsUpper(actorDirs *ateworkerpb.ActorDirs) error {
+	if useTmpfsRamCache(actorDirs) {
+		_ = os.RemoveAll(actorRamCacheDir(actorDirs))
+	}
 	if isBtrfsSnapshotDir(actorDirs) {
 		return btrfssubvol.RemoveAll(activeSubvolDir(actorDirs))
 	}

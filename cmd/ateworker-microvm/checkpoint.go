@@ -207,7 +207,19 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 	shipsRootfs := includesRootfs(scope)
 	var durableFiles []string
 	if useBtrfs {
-		for _, f := range []string{baseIDFile, "config.json", "state.json", memoryRangesFile} {
+		useRam := useTmpfsRamCache(actorDirs)
+		var tokBytes []byte
+		var baseSubvol string
+		if useRam {
+			var err error
+			tokBytes, err = newCheckpointTokenBytes()
+			if err != nil {
+				return nil, fmt.Errorf("while generating checkpoint token: %w", err)
+			}
+			prevTok, _ := os.ReadFile(filepath.Join(actorRamCacheDir(actorDirs), ramBaseTokenFile))
+			baseSubvol = findBaseSubvolumeByToken(snapshotRootDir(actorDirs), prevTok)
+		}
+		for _, f := range []string{baseIDFile, "config.json", "state.json", memoryRangesFile, memCrc32cFile} {
 			_ = os.Remove(filepath.Join(activeDir, f))
 		}
 		if durable {
@@ -233,7 +245,11 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 				}
 			}
 		}
-		if err := writeBtrfsCheckpointToken(activeDir); err != nil {
+		if useRam {
+			if err := os.WriteFile(filepath.Join(activeDir, btrfsCheckpointTokenFile), tokBytes, 0o600); err != nil {
+				return nil, fmt.Errorf("while writing btrfs checkpoint token: %w", err)
+			}
+		} else if err := writeBtrfsCheckpointToken(activeDir); err != nil {
 			return nil, fmt.Errorf("while writing btrfs checkpoint token: %w", err)
 		}
 		tSnapSubvol := time.Now()
@@ -252,7 +268,58 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 		} else {
 			_ = os.RemoveAll(filepath.Join(checkpointDir, "rootfs-upper"))
 		}
-		if scope == ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
+		if useRam {
+			ramDir := actorRamCacheDir(actorDirs)
+			g, gctx := errgroup.WithContext(ctx)
+			if durable {
+				vols := durableVolumeNames(req.GetSpec().GetContainers())
+				g.Go(func() error {
+					t := time.Now()
+					defer func() { dDurable += time.Since(t) }()
+					for _, vol := range vols {
+						srcExt4 := filepath.Join(ramDir, "durable-dir", vol+".ext4")
+						if st, serr := os.Stat(srcExt4); serr != nil || !st.Mode().IsRegular() {
+							continue
+						}
+						if err := os.MkdirAll(filepath.Join(checkpointDir, "durable-dir", vol), 0o777); err != nil {
+							return err
+						}
+						baseExt4 := ""
+						if baseSubvol != "" {
+							baseExt4 = filepath.Join(baseSubvol, "durable-dir", vol+".ext4")
+						}
+						dstExt4 := filepath.Join(checkpointDir, "durable-dir", vol+".ext4")
+						crcName := durableCrcFileName(vol)
+						if _, _, err := syncTmpfsToBtrfsIncremental(
+							srcExt4,
+							baseExt4,
+							dstExt4,
+							filepath.Join(ramDir, crcName),
+							filepath.Join(checkpointDir, crcName),
+						); err != nil {
+							return fmt.Errorf("while syncing incremental durable-dir %s to btrfs: %w", vol, err)
+						}
+					}
+					return nil
+				})
+			}
+			if scope == ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
+				g.Go(func() error {
+					t := time.Now()
+					d, err := s.snapshotVMStateBtrfsTmpfs(gctx, client, ra, actorUID, ramDir, baseSubvol, checkpointDir)
+					if err != nil {
+						d = time.Since(t)
+					}
+					dSnapshot = d
+					return err
+				})
+			}
+			if err := g.Wait(); err != nil {
+				return nil, err
+			}
+			_ = os.WriteFile(filepath.Join(ramDir, ramBaseTokenFile), tokBytes, 0o600)
+			_ = os.WriteFile(filepath.Join(ramDir, ramCleanTokenFile), tokBytes, 0o600)
+		} else if scope == ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
 			t := time.Now()
 			d, err := s.snapshotVMStateBtrfs(ctx, client, ra, actorUID, checkpointDir)
 			if err != nil {
@@ -389,6 +456,47 @@ func (s *AteWorkerService) snapshotVMState(ctx context.Context, client *ch.Clien
 	// The RO lower never ships (reconstructed from the OCI image at restore).
 	// The disk-backed upper ships as its own tar from CheckpointWorkload; a
 	return dSnapshot, nil
+}
+
+func (s *AteWorkerService) snapshotVMStateBtrfsTmpfs(ctx context.Context, client *ch.Client, ra *runningActor, actorUID, ramDir, baseSubvol, checkpointDir string) (time.Duration, error) {
+	baseID := actorUID
+	if ra != nil && ra.baseID != "" {
+		baseID = ra.baseID
+	}
+	if err := os.WriteFile(filepath.Join(checkpointDir, baseIDFile), []byte(baseID), 0o600); err != nil {
+		return 0, fmt.Errorf("while writing %s: %w", baseIDFile, err)
+	}
+	for _, f := range []string{"config.json", "state.json", memoryRangesFile, memCrc32cFile} {
+		_ = os.Remove(filepath.Join(checkpointDir, f))
+	}
+
+	tSnapshot := time.Now()
+	if err := client.Snapshot(ctx, checkpointDir); err != nil {
+		return 0, fmt.Errorf("while snapshotting guest VM state: %w", err)
+	}
+	dstMem := filepath.Join(checkpointDir, memoryRangesFile)
+	if _, err := os.Stat(dstMem); errors.Is(err, os.ErrNotExist) {
+		srcMem := filepath.Join(ramDir, memoryRangesFile)
+		baseMem := ""
+		if baseSubvol != "" {
+			baseMem = filepath.Join(baseSubvol, memoryRangesFile)
+		}
+		written, cloned, serr := syncTmpfsToBtrfsIncremental(
+			srcMem,
+			baseMem,
+			dstMem,
+			filepath.Join(ramDir, memCrc32cFile),
+			filepath.Join(checkpointDir, memCrc32cFile),
+		)
+		if serr != nil {
+			return 0, fmt.Errorf("while syncing incremental guest memory to btrfs: %w", serr)
+		}
+		slog.InfoContext(ctx, "Synced incremental guest memory to btrfs",
+			slog.String("id", actorUID),
+			slog.Bool("ficlone", cloned),
+			slog.Int64("written_bytes", written))
+	}
+	return time.Since(tSnapshot), nil
 }
 
 func (s *AteWorkerService) snapshotVMStateBtrfs(ctx context.Context, client *ch.Client, ra *runningActor, actorUID, activeDir string) (time.Duration, error) {

@@ -220,7 +220,11 @@ func untarDurableVolumes(dir, snapshotDir string, volumes []string, preserveRest
 					continue
 				}
 			}
-			if err := cloneFileCoW(tarPath, imgPath); err != nil {
+			if strings.HasPrefix(imgPath, ramCacheBaseDir+"/") {
+				if err := stageTmpfsHugepageFile(tarPath, imgPath); err != nil {
+					return fmt.Errorf("while staging durable-dir volume image %q to tmpfs: %w", vol, err)
+				}
+			} else if err := cloneFileCoW(tarPath, imgPath); err != nil {
 				return fmt.Errorf("while restoring durable-dir volume image %q: %w", vol, err)
 			}
 			continue
