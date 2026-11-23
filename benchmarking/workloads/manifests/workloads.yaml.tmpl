@@ -37,8 +37,14 @@ spec:
   - name: ${SANDBOX_CLASS}
   workerImage: ko://go.ate.dev/substrate/cmd/ateworker-${SANDBOX_CLASS}
   template:
+    nodeSelector:
+      cloud.google.com/gke-nodepool: substrate-ubuntu-pool
     # Lets gvisor and microvm workers share a node tainted ate.dev/sandboxClass=shared.
     tolerations:
+    - key: ate.dev/glovebox
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
     - key: ate.dev/sandboxClass
       operator: Equal
       value: shared
