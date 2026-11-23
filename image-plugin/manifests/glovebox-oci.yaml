@@ -1,0 +1,113 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Standalone ImagePlugin DaemonSet backed by preloaded Golden Glovebox Zoned Btrfs
+# or right-sized EROFS block devices in GCS Rapid. Supports --mode=shared-ro
+# (one read-only CoW ZBD mount per image per node, shared across co-located
+# sandboxes) and --mode=per-actor-cow (one isolated CoW ZBD clone per sandbox lease),
+# with --fs=btrfs or --fs=erofs.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: image-plugin-glovebox
+  namespace: ate-system
+  labels:
+    app: ate-image-plugin
+    ate.dev/image-plugin: glovebox
+spec:
+  selector:
+    matchLabels:
+      app: ate-image-plugin
+      ate.dev/image-plugin: glovebox
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 100%
+  template:
+    metadata:
+      labels:
+        app: ate-image-plugin
+        ate.dev/image-plugin: glovebox
+    spec:
+      hostPID: true
+      hostNetwork: true
+      priorityClassName: ate-node-critical
+      terminationGracePeriodSeconds: 330
+      nodeSelector:
+        ate.dev/glovebox: "true"
+      tolerations:
+      - key: ate.dev/glovebox
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      - key: ate.dev/sandboxClass
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: image-plugin-glovebox
+        image: ko://go.ate.dev/substrate/image-plugin/cmd/glovebox-oci
+        args:
+        - --listen-socket=/run/ate/image-plugin.sock
+        - --pool-socket=/host-tmp/vduse_zbd_pool.sock
+        - --mode=shared-ro
+        - --fs=btrfs
+        - --rapid-bucket=RAPID_BUCKET_PLACEHOLDER
+        - --work-dir=/var/lib/ate/image-plugin-cache/glovebox
+        - --images-jsonl=/var/lib/ate/image-plugin-cache/glovebox/images-16-bench-erofs.jsonl
+        - --zone-size-mb=256
+        - --num-zones=128
+        - --read-ahead-kb=2048
+        - --idle-ttl=10m
+        - --drain-timeout=5m
+        - --drain-complete-file=/run/ate/drain-complete
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: SSL_CERT_FILE
+          value: /proc/1/root/etc/ssl/certs/ca-certificates.crt
+        readinessProbe:
+          exec:
+            command:
+            - /ko-app/glovebox-oci
+            - --probe
+            - --listen-socket=/run/ate/image-plugin.sock
+          initialDelaySeconds: 2
+          periodSeconds: 2
+        securityContext:
+          privileged: true
+          runAsUser: 0
+          runAsGroup: 0
+        volumeMounts:
+        - name: run-ate
+          mountPath: /run/ate
+        - name: ate-base
+          mountPath: /var/lib/ate
+          mountPropagation: Bidirectional
+        - name: host-tmp
+          mountPath: /host-tmp
+      volumes:
+      - name: run-ate
+        hostPath:
+          path: /run/ate
+          type: DirectoryOrCreate
+      - name: ate-base
+        hostPath:
+          path: /var/lib/ate
+          type: DirectoryOrCreate
+      - name: host-tmp
+        hostPath:
+          path: /tmp
+          type: Directory
