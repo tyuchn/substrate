@@ -32,6 +32,7 @@ import (
 	"unsafe"
 
 	"go.ate.dev/substrate/cmd/atelet/internal/ateletpath"
+	"go.ate.dev/substrate/internal/btrfssubvol"
 	"golang.org/x/sys/unix"
 )
 
@@ -40,9 +41,11 @@ var btrfsTemplateGzip []byte
 
 const (
 	lvmVGDir            = "/host/dev/vg_snapshots"
+	sharedZBDPath       = "/host/dev/vg_snapshots/shared-zbd"
 	lvmVolumeSize       = 16 << 30 // 16 GiB per VDUSE ZBD volume (64 x 256 MiB zones)
 	loopPoolDefaultSize = 36
 	blkResetZoneIoctl   = 0x40101283 // _IOW(0x12, 131, struct blk_zone_range)
+	ramCacheRoot        = "/var/lib/ate/ram-cache"
 )
 
 type blkZoneRange struct {
@@ -103,6 +106,11 @@ var (
 	initLoopPoolOnce sync.Once
 )
 
+func hasSharedZBD() bool {
+	_, err := os.Stat(sharedZBDPath)
+	return err == nil
+}
+
 func PrewarmLoopPool() {
 	if _, err := os.Stat(lvmVGDir); err == nil {
 		initLoopPoolOnce.Do(initLoopPool)
@@ -148,12 +156,89 @@ func prewarmLVMVolume(lvPath string, extents []sparseExtent) error {
 	return resetAndWriteTemplate(f, extents)
 }
 
+func ensureRamCacheTmpfs() {
+	if err := os.MkdirAll(ramCacheRoot, 0o755); err != nil {
+		slog.Error("Failed to create ram-cache directory", "path", ramCacheRoot, "err", err)
+		return
+	}
+	var st unix.Statfs_t
+	if err := unix.Statfs(ramCacheRoot, &st); err == nil && st.Type == unix.TMPFS_MAGIC {
+		_ = unix.Mount("tmpfs", ramCacheRoot, "tmpfs", unix.MS_REMOUNT, "huge=advise,size=64G,mode=0755")
+	} else {
+		if err := unix.Mount("tmpfs", ramCacheRoot, "tmpfs", unix.MS_NOATIME|unix.MS_NODIRATIME, "huge=advise,size=64G,mode=0755"); err != nil {
+			slog.Error("Failed to mount tmpfs with huge=advise on ram-cache", "path", ramCacheRoot, "err", err)
+			return
+		}
+	}
+	if entries, err := os.ReadDir(ramCacheRoot); err == nil {
+		for _, entry := range entries {
+			uid := entry.Name()
+			if _, serr := os.Stat(ateletpath.ActorPath(uid)); errors.Is(serr, os.ErrNotExist) {
+				_ = os.RemoveAll(filepath.Join(ramCacheRoot, uid))
+			}
+		}
+	}
+	slog.Info("Mounted 2 MiB THP tmpfs working cache", "path", ramCacheRoot)
+}
+
+func cleanupSharedZBDActorDir(snapDir string) {
+	localCkptDir := filepath.Join(snapDir, "local-checkpoint")
+	if entries, err := os.ReadDir(localCkptDir); err == nil {
+		for _, entry := range entries {
+			_ = btrfssubvol.RemoveAll(filepath.Join(localCkptDir, entry.Name()))
+		}
+	}
+	for _, sub := range []string{"active", "checkpoint-state", "restore-state"} {
+		_ = btrfssubvol.RemoveAll(filepath.Join(snapDir, sub))
+	}
+	_ = os.RemoveAll(snapDir)
+}
+
+func initSharedZBD(snapshotsRoot string, start time.Time) {
+	if err := os.MkdirAll(snapshotsRoot, 0o755); err != nil {
+		slog.Error("Failed to create snapshots root for shared ZBD", "path", snapshotsRoot, "err", err)
+		return
+	}
+	if !btrfssubvol.IsBtrfs(snapshotsRoot) {
+		if err := unix.Mount(sharedZBDPath, snapshotsRoot, "btrfs", unix.MS_NOATIME|unix.MS_NODIRATIME, "nospace_cache,nodiscard,nodatasum"); err != nil {
+			slog.Error("Failed to mount shared Glovebox ZBD btrfs volume", "device", sharedZBDPath, "mountpoint", snapshotsRoot, "err", err)
+			return
+		}
+	}
+	if entries, err := os.ReadDir(snapshotsRoot); err == nil {
+		for _, entry := range entries {
+			uid := entry.Name()
+			if uid == ".cache" || uid == "lost+found" {
+				continue
+			}
+			snapDir := ateletpath.ActorSnapshotPath(uid)
+			if mounted, _ := isMountPoint(snapDir); mounted {
+				_ = unix.Unmount(snapDir, unix.MNT_DETACH)
+			}
+			if _, err := os.Stat(ateletpath.ActorPath(uid)); errors.Is(err, os.ErrNotExist) {
+				cleanupSharedZBDActorDir(snapDir)
+			}
+		}
+	}
+	slog.Info("Mounted shared Glovebox VDUSE ZBD btrfs volume",
+		"device", sharedZBDPath,
+		"mountpoint", snapshotsRoot,
+		"duration", time.Since(start),
+	)
+}
+
 func initLoopPool() {
 	start := time.Now()
+	ensureRamCacheTmpfs()
+
+	snapshotsRoot := filepath.Dir(ateletpath.ActorSnapshotPath("dummy"))
+	if hasSharedZBD() {
+		initSharedZBD(snapshotsRoot, start)
+		return
+	}
 
 	// Unmount any snapshot mounts left over from a previous atelet run before
 	// reformatting all LVM slots into loopPoolFree.
-	snapshotsRoot := filepath.Dir(ateletpath.ActorSnapshotPath("dummy"))
 	if entries, err := os.ReadDir(snapshotsRoot); err == nil {
 		for _, entry := range entries {
 			uid := entry.Name()
@@ -277,6 +362,10 @@ func ensureSnapshotLoopMount(actorUID string) error {
 	if _, err := os.Stat(lvmVGDir); err != nil {
 		return nil
 	}
+	if hasSharedZBD() {
+		initLoopPoolOnce.Do(initLoopPool)
+		return os.MkdirAll(ateletpath.ActorSnapshotPath(actorUID), 0o755)
+	}
 	snapDir := ateletpath.ActorSnapshotPath(actorUID)
 	if err := os.MkdirAll(snapDir, 0o755); err != nil {
 		return fmt.Errorf("creating snapshot mountpoint: %w", err)
@@ -306,7 +395,12 @@ func ensureSnapshotLoopMount(actorUID string) error {
 }
 
 func teardownSnapshotLoopMount(actorUID string) error {
+	_ = os.RemoveAll(filepath.Join(ramCacheRoot, actorUID))
 	if _, err := os.Stat(lvmVGDir); err != nil {
+		return nil
+	}
+	if hasSharedZBD() {
+		cleanupSharedZBDActorDir(ateletpath.ActorSnapshotPath(actorUID))
 		return nil
 	}
 	snapDir := ateletpath.ActorSnapshotPath(actorUID)
