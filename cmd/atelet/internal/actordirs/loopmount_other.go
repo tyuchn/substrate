@@ -25,3 +25,9 @@ func ensureSnapshotLoopMount(actorUID string) error {
 func teardownSnapshotLoopMount(actorUID string) error {
 	return nil
 }
+
+func IsGloveboxPerActorZBDEnabled() bool {
+	return false
+}
+
+func DestroyGloveboxActorZBD(string) {}

@@ -160,6 +160,7 @@ func RemoveActorDirs(actorUID string) error {
 	if err := RemoveActorFilesExceptState(actorUID); err != nil {
 		return err
 	}
+	DestroyGloveboxActorZBD(actorUID)
 	if err := os.Remove(ateletpath.ActorSnapshotStateFile(actorUID)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("while deleting the actor's snapshot state: %w", err)
 	}

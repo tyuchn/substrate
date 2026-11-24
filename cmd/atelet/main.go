@@ -1497,7 +1497,7 @@ func (s *Atelet) uploadLocalCheckpointDir(ctx context.Context, req *ateletpb.Pro
 		if rec, err = unmarshalSandboxRecord(manifest); err != nil {
 			return "", false, err
 		}
-		if rec.BootID != s.bootID {
+		if rec.BootID != s.bootID && !actordirs.IsGloveboxPerActorZBDEnabled() {
 			err = fmt.Errorf("local snapshot %q was written before the node last rebooted: %w", localSnapshotName, os.ErrNotExist)
 		}
 	}
@@ -1534,7 +1534,21 @@ func (s *Atelet) uploadLocalCheckpointDir(ctx context.Context, req *ateletpb.Pro
 	}
 
 	// The local snapshot stays until the upload succeeds, so a retry can
-	// upload it again.
+	// upload it again. When per-actor Glovebox ZBD mobility is enabled, the
+	// checkpoint subvolume already persists on the actor's GCS Rapid ZBD, so
+	// only the manifest marker is uploaded to object storage.
+	if actordirs.IsGloveboxPerActorZBDEnabled() {
+		remote := *rec
+		remote.BootID = ""
+		manifestBytes, merr := json.Marshal(&remote)
+		if merr != nil {
+			return rec.SandboxClass, false, fmt.Errorf("while marshaling glovebox snapshot manifest: %w", merr)
+		}
+		if err := pluginsocket.CallError(s.uploadManifest(ctx, actor, uri.String(), manifestBytes)); err != nil {
+			return rec.SandboxClass, false, err
+		}
+		return rec.SandboxClass, true, nil
+	}
 	if err := pluginsocket.CallError(s.uploadSnapshot(ctx, actor, uri, localDir, rec)); err != nil {
 		return rec.SandboxClass, false, err
 	}
@@ -1584,7 +1598,7 @@ func readLocalSnapshot(localDir, bootID string) (*sandboxAssetsRecord, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errUnusableLocalSnapshot, err)
 	}
-	if rec.BootID != bootID {
+	if rec.BootID != bootID && !actordirs.IsGloveboxPerActorZBDEnabled() {
 		return nil, fmt.Errorf("%w: written before the node last rebooted", errUnusableLocalSnapshot)
 	}
 	if err := checkLocalSnapshotFiles(localDir, rec.SnapshotFiles); err != nil {
@@ -1734,6 +1748,20 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	localErr := errListedLocalSnapshot
 	if useLocal {
 		localRec, localErr = readLocalSnapshot(localDir, s.bootID)
+	} else if actordirs.IsGloveboxPerActorZBDEnabled() {
+		if mBytes, merr := readSnapshotManifest(localDir); merr == nil {
+			if zRec, uerr := unmarshalSandboxRecord(mBytes); uerr == nil {
+				if ferr := checkLocalSnapshotFiles(localDir, zRec.SnapshotFiles); ferr == nil {
+					localRec = zRec
+					localErr = nil
+					s.snapshots.CommitLocal(actorUID, snapshottracker.SnapshotRef{
+						Snapshot:   req.GetSnapshot(),
+						CommitTime: time.Now(),
+						Actor:      actorRef,
+					})
+				}
+			}
+		}
 	}
 	durable := req.GetSnapshot().GetObject()
 	if localErr == nil {

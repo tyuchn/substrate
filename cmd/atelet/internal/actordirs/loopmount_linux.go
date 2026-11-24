@@ -105,6 +105,10 @@ var (
 )
 
 func PrewarmLoopPool() {
+	if IsGloveboxPerActorZBDEnabled() {
+		ensureRamCacheTmpfs()
+		return
+	}
 	if _, err := os.Stat(lvmVGDir); err == nil {
 		initLoopPoolOnce.Do(initLoopPool)
 	}
@@ -302,6 +306,9 @@ func isMountPoint(dir string) (bool, error) {
 }
 
 func ensureSnapshotLoopMount(actorUID string) error {
+	if cfg, ok := loadGloveboxZBDConfig(); ok {
+		return ensureGloveboxActorZBD(actorUID, cfg)
+	}
 	if _, err := os.Stat(lvmVGDir); err != nil {
 		return nil
 	}
@@ -334,6 +341,9 @@ func ensureSnapshotLoopMount(actorUID string) error {
 }
 
 func teardownSnapshotLoopMount(actorUID string) error {
+	if cfg, ok := loadGloveboxZBDConfig(); ok {
+		return detachGloveboxActorZBD(actorUID, cfg)
+	}
 	_ = os.RemoveAll(filepath.Join(ramCacheRoot, actorUID))
 	if _, err := os.Stat(lvmVGDir); err != nil {
 		return nil

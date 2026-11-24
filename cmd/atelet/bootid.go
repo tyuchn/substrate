@@ -19,6 +19,7 @@ import (
 	"os"
 	"strings"
 
+	"go.ate.dev/substrate/cmd/atelet/internal/actordirs"
 	"go.ate.dev/substrate/cmd/atelet/internal/ateletpath"
 )
 
@@ -52,6 +53,6 @@ func localSnapshotBootCheck(bootID string) func(actorUID, snapshotUUID string) b
 			return false
 		}
 		rec, err := unmarshalSandboxRecord(manifest)
-		return err == nil && rec.BootID == bootID
+		return err == nil && (rec.BootID == bootID || actordirs.IsGloveboxPerActorZBDEnabled())
 	}
 }

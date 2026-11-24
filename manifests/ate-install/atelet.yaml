@@ -122,6 +122,7 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
     spec:
+      hostPID: true
       serviceAccountName: atelet
       priorityClassName: ate-node-critical
       # Budget for the full shutdown sequence: --drain-delay (0 for atelet) +

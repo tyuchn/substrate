@@ -446,10 +446,13 @@ func syncTmpfsToBtrfsIncremental(srcTmpfsPath, baseBtrfsPath, dstBtrfsPath, crcC
 		}
 	}
 
-	// Start asynchronous non-blocking writeback of the dirtied range so the next
-	// checkpoint's FICLONE finds ordered extents already persisted on the ZBD.
+	// Wait for dirty range writeback so the checkpoint is persisted on the ZBD
+	// before CheckpointWorkload returns, matching XFS FICLONE durability.
 	if minDirtyOff >= 0 && maxDirtyEnd > minDirtyOff {
-		_ = unix.SyncFileRange(dstFd, minDirtyOff, maxDirtyEnd-minDirtyOff, unix.SYNC_FILE_RANGE_WRITE)
+		const syncFlags = unix.SYNC_FILE_RANGE_WAIT_BEFORE | unix.SYNC_FILE_RANGE_WRITE | unix.SYNC_FILE_RANGE_WAIT_AFTER
+		if err := unix.SyncFileRange(dstFd, minDirtyOff, maxDirtyEnd-minDirtyOff, syncFlags); err != nil {
+			return writtenBytes, cloned, fmt.Errorf("syncing delta range on %s: %w", dstBtrfsPath, err)
+		}
 	}
 
 	if crcCachePath != "" {
